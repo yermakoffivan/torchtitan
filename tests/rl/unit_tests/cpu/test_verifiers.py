@@ -287,7 +287,7 @@ def test_setup_spawns_workers_with_the_env_server_address_and_close_stops_the_wo
     )
     rollouter = object.__new__(VerifiersRollouter)
     rollouter._config = SimpleNamespace(
-        worker=worker, num_threads_per_worker=3, rollouts_per_worker=12
+        worker=worker, rollouts_per_worker=12, rollouts_per_thread=4
     )
     # 24 training rollouts in flight / 12 per worker -> 2 workers
     rollouter._max_rollouts_in_flight = 24

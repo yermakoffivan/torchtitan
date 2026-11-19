@@ -24,6 +24,7 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.actors.monarch.actor import Actor
 from torchtitan.rl.rollout.rollouter import BaseRolloutWorker
 from torchtitan.rl.rollout.types import RolloutGroup
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 
 class RolloutWorkerActor(Actor):
@@ -62,6 +63,14 @@ class RolloutWorkerActor(Actor):
             vision_processor_config=vision_processor_config,
         )
 
+        # Setup objects live until exit: freeze them, so later full GCs skip them.
+        GarbageCollector.freeze(
+            "Full GC before freezing the rollout worker's setup objects"
+        )
+
+        # Start measuring after setup and the freeze: both hold the loop.
+        self._worker.start_process_metrics()
+
     @concurrent_endpoint
     async def run_group(
         self,
@@ -73,7 +82,7 @@ class RolloutWorkerActor(Actor):
         group_size: int,
         sampling: Any,
     ) -> RolloutGroup:
-        return await self._worker.run_group(
+        group = await self._worker.run_group(
             generate_fn=generate_fn,
             release_session_fn=release_session_fn,
             sample=sample,
@@ -81,6 +90,8 @@ class RolloutWorkerActor(Actor):
             group_size=group_size,
             sampling=sampling,
         )
+        group.metrics += self._worker.flush_process_metrics(group_id)
+        return group
 
     @concurrent_endpoint
     async def sync_log_step(self, step: int) -> None:

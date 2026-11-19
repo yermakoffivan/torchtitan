@@ -22,6 +22,7 @@ from torchtitan.components.renderer import RendererConfig
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import Configurable
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.advantage import AdvantageEstimator
 from torchtitan.rl.rollout.data import RLDataset, RolloutDataLoader
 from torchtitan.rl.rollout.message_env import MessageEnv
@@ -116,17 +117,15 @@ class Rollouter(Configurable):
         rounded up: 300 training rollouts in flight / 128 per worker -> 3 workers. Not a cap: validation
         rollouts come on top, and groups can land unevenly."""
 
-        # TODO: at 128 rollouts per worker, renders and parses (`TokenEnv`) may queue on these threads.
-        #   Measure that wait, then size the pool from it.
-        num_threads_per_worker: int = 4
-        """Size of each worker process's default thread pool executor, i.e. the pool
-        behind every `asyncio.to_thread` call in that process."""
+        rollouts_per_thread: int = 4
+        """Rollouts per thread in each worker's `asyncio.to_thread` pool. Threads = rollouts_per_worker /
+        rollouts_per_thread, rounded up: 128 / 4 -> 32, 7 / 4 -> 2, 2 / 4 -> 1. Lower it when rollouts
+        block threads, e.g. 1 for one blocking call per rollout."""
 
         def __post_init__(self) -> None:
-            if self.num_threads_per_worker < 1:
+            if self.rollouts_per_thread < 1:
                 raise ValueError(
-                    "num_threads_per_worker must be at least 1, got "
-                    f"{self.num_threads_per_worker}"
+                    f"rollouts_per_thread must be at least 1, got {self.rollouts_per_thread}"
                 )
 
     def __init__(self, config: Config, *, max_rollouts_in_flight: int) -> None:
@@ -196,7 +195,9 @@ class Rollouter(Configurable):
         self._worker_actors = await actor_system.spawn_rollout_workers(
             self._config.worker,
             num_workers=num_workers,
-            num_threads=self._config.num_threads_per_worker,
+            num_threads=math.ceil(
+                self._config.rollouts_per_worker / self._config.rollouts_per_thread
+            ),
             **(worker_kwargs or {}),
         )
         await self._worker_actors.setup_async.call(
@@ -346,6 +347,9 @@ class BaseRolloutWorker(Configurable, ABC):
     def __init__(self, config: Config) -> None:
         self.rubric: Rubric = config.rubric.build()
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
+        # Created in start_process_metrics, so setup isn't counted as lag.
+        self._event_loop_lag: m.EventLoopLag
+        self._thread_pool_lag: m.ThreadPoolLag
 
     async def setup_async(
         self,
@@ -356,6 +360,40 @@ class BaseRolloutWorker(Configurable, ABC):
         vision_processor_config: VisionProcessor.Config | None = None,
     ) -> None:
         """Called once in the worker process after it is spawned."""
+
+    def start_process_metrics(self) -> None:
+        """Start measuring this process's event-loop lag and thread-pool lag. The process that hosts
+        the worker (`RolloutWorkerActor`) calls it once, after `setup_async`, so setup isn't counted."""
+        self._event_loop_lag = m.EventLoopLag("rollout_worker")
+        self._thread_pool_lag = m.ThreadPoolLag("rollout_worker")
+
+    def flush_process_metrics(self, group_id: int) -> list[m.Metric]:
+        """Return this process's lag since the previous training group and its RAM (now and peak),
+        then reset the lag trackers.
+
+            training group (group_id >= 0)    gets the metrics
+            validation group (group_id < 0)   gets none: the controller never reads its metrics.
+                                              Its lag counts in the next training group.
+        """
+        if group_id < 0:
+            return []
+
+        # RAM this worker uses now (VmRSS) and the most it has used (VmHWM), shared libraries counted
+        # in full. Each line reads e.g. "VmRSS:  1745628 kB".
+        with open("/proc/self/status") as status:
+            kib = {
+                line.split(":")[0]: int(line.split()[1])
+                for line in status
+                if line.startswith(("VmRSS:", "VmHWM:"))
+            }
+        return [
+            # The event loop's longest delay, and how many ms late it ran per second
+            *self._event_loop_lag.flush(),
+            # How late the thread pool starts a call: the longest delay, and ms late per second
+            *self._thread_pool_lag.flush(),
+            m.Metric("rollout_worker/ram_gib", m.Max(kib["VmRSS"] / 2**20)),
+            m.Metric("rollout_worker/peak_ram_gib", m.Max(kib["VmHWM"] / 2**20)),
+        ]
 
     async def score_group(
         self,
