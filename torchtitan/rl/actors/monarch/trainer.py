@@ -73,6 +73,10 @@ class _TrainerActorEndpoints:
         return time.perf_counter() - start
 
     @concurrent_endpoint
+    async def start_reading(self, *, num_microbatch_groups: int) -> None:
+        await super().start_reading(num_microbatch_groups=num_microbatch_groups)
+
+    @concurrent_endpoint
     async def forward_backward(
         self,
         *,
