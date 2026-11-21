@@ -37,6 +37,11 @@ from torchtitan.rl.model_state_dict_transport import (
     TensorShard,
     TrainerSource,
 )
+from torchtitan.rl.torch_transport_rdma import (
+    check_rdma_probes,
+    RDMAByteBuffers,
+    RDMAProbe,
+)
 from torchtitan.rl.trainer.batcher import MicrobatchPacker
 from torchtitan.rl.trainer.microbatch_group_reader import (
     MicrobatchGroupReader,
@@ -265,6 +270,9 @@ class Trainer(Configurable):
         )
         # Set on the leader by `receive_replica_column` before each `forward_backward`.
         self._replica_column: ReplicaColumn | None = None
+        # On leaders, once `check_rdma_probes` runs: reads the rollout groups that stay in
+        # the rollout workers (`BaseRolloutWorker.Config.rdma_min_group_bytes`).
+        self._rdma_byte_buffers: RDMAByteBuffers | None = None
 
     @property
     def policy_version(self) -> int:
@@ -336,6 +344,20 @@ class Trainer(Configurable):
         )
         return out
 
+    async def check_rdma_probes(self, probes: list[RDMAProbe]) -> None:
+        """On a DP replica's leader, at setup when rollout groups go by RDMA: start this rank's
+        torch transport and read each rollout worker's probe (`check_rdma_probes`).
+
+        Raises:
+            ValueError: torch transport is unavailable here, or a probe read failed; the
+                message names the hosts.
+        """
+        assert self._is_replica_leader and self._rdma_byte_buffers is None
+        self._rdma_byte_buffers = RDMAByteBuffers()
+        # The reads block; off the event loop, a read that hangs past the controller's timeout
+        # leaves this actor able to answer later calls (e.g. shutdown).
+        await asyncio.to_thread(check_rdma_probes, self._rdma_byte_buffers, probes)
+
     async def receive_replica_column(self, column: ReplicaColumn) -> None:
         """On a DP replica's leader: keep the replica's column of the next step's plan and the
         rollouts it names, for the next `forward_backward` to pack."""
@@ -389,6 +411,7 @@ class Trainer(Configurable):
             column=column,
             training_sample_builder=self._training_sample_builder,
             microbatch_packer=self._microbatch_packer,
+            rdma_byte_buffers=self._rdma_byte_buffers,
         )
         # The reader frees each rollout group once its samples exist.
         del column
@@ -426,9 +449,15 @@ class Trainer(Configurable):
 
         metrics = combine_microbatch_metrics(microbatch_metrics)
         # The slowest rank's times this step (max over the loss mesh), totals, hidden or not:
-        # its replica leader's packing (the leader sends it with each group, so the last
-        # pipeline stage reports it too) and its own broadcast time.
+        # its replica leader's read and packing (the leader sends them with each group, so the
+        # last pipeline stage reports them too) and its own broadcast time.
         max_reduced_timing = {
+            "timing/trainer/read_rollout_groups/max": torch.tensor(
+                reader.read_s, device=engine.device
+            ),
+            "payload/trainer_read_bytes/max": torch.tensor(
+                float(reader.read_bytes), device=engine.device
+            ),
             "timing/trainer/pack_microbatches/max": torch.tensor(
                 reader.pack_s, device=engine.device
             ),

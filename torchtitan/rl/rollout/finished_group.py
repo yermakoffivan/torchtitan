@@ -10,7 +10,9 @@ controller keeps until the group's step and the trainer's DP replica leaders unp
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from torchtitan.rl.controller.metrics import compute_rollout_metrics
 from torchtitan.rl.rollout.packed_group import pack_rollout_group, PackedRolloutGroup
@@ -20,6 +22,16 @@ from torchtitan.rl.rollout.types import (
     RolloutGroup,
     RolloutGroupSummary,
 )
+
+if TYPE_CHECKING:
+    from torchtitan.rl.rollout.packed_group_handle import PackedRolloutGroupHandle
+
+# Packs a group (`pack_rollout_group`); a rollout worker that keeps large training groups in
+# registered buffers passes `RolloutGroupBuffers.pack`, which returns a handle for those.
+PackFn = Callable[
+    [RolloutGroup],
+    tuple[RolloutGroupSummary, "PackedRolloutGroup | PackedRolloutGroupHandle"],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +47,9 @@ class FinishedRolloutGroup:
 
     summary: RolloutGroupSummary
 
-    packed: PackedRolloutGroup
+    packed: PackedRolloutGroup | PackedRolloutGroupHandle
+    """The group's bytes, or a handle to them when they stay in the rollout worker
+    (`BaseRolloutWorker.Config.rdma_min_group_bytes`)."""
 
     recorder_lines: str = ""
     """The group's `RolloutSampleRecorder` JSONL lines, encoded from the full group; "" for
@@ -43,9 +57,13 @@ class FinishedRolloutGroup:
 
     @classmethod
     def from_group(
-        cls, group: RolloutGroup, *, recorder_lines: str = ""
+        cls,
+        group: RolloutGroup,
+        *,
+        recorder_lines: str = "",
+        pack: PackFn = pack_rollout_group,
     ) -> FinishedRolloutGroup:
-        return cls(*pack_rollout_group(group), recorder_lines=recorder_lines)
+        return cls(*pack(group), recorder_lines=recorder_lines)
 
     @property
     def group_id(self) -> int:
@@ -88,14 +106,19 @@ def slim_rollout_group(group: RolloutGroup) -> RolloutGroup:
 
 
 def finish_rollout_group(
-    group: RolloutGroup, *, for_training: bool, encoder: RolloutSampleEncoder
+    group: RolloutGroup,
+    *,
+    for_training: bool,
+    encoder: RolloutSampleEncoder,
+    pack: PackFn = pack_rollout_group,
 ) -> FinishedRolloutGroup:
     """Turn a scored group into what the rollout worker returns.
 
     For training: check its rollouts' prompt prefixes (`check_prompt_prefixes`, the one check
     that reads token values, so it runs where the arrays are), compute the group's rollout
-    metrics and recorder lines from the full group, then slim it and pack it. Validation groups
-    are packed as is: the controller unpacks them, computes their metrics and records them.
+    metrics and recorder lines from the full group, then slim it and pack it with `pack`.
+    Validation groups are packed as is, always by value (`pack_rollout_group`): the controller
+    unpacks them, computes their metrics and records them.
     """
     # TODO: finish validation groups here too (encode them with `is_validation=True`; the
     # controller then only prefixes and renames their metrics), and drop `for_training` and
@@ -109,5 +132,5 @@ def finish_rollout_group(
     )
     recorder_lines = encoder.encode(is_validation=False, rollout_groups=[group])
     return FinishedRolloutGroup.from_group(
-        slim_rollout_group(group), recorder_lines=recorder_lines
+        slim_rollout_group(group), recorder_lines=recorder_lines, pack=pack
     )

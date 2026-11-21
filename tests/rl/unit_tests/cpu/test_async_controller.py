@@ -11,13 +11,18 @@ import asyncio
 import itertools
 import json
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
 import torch
-from torchtitan.rl.controller.controller import Controller, ValidationConfig
+from torchtitan.rl.controller.controller import (
+    check_rdma_probes_on_leaders,
+    Controller,
+    ValidationConfig,
+)
 from torchtitan.rl.controller.metrics import (
     compute_perf_ratio_metrics,
     compute_policy_age_metrics,
@@ -32,6 +37,7 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
 from torchtitan.rl.rollout.packed_group import pack_rollout_group, PackedRolloutGroup
+from torchtitan.rl.rollout.packed_group_handle import PackedRolloutGroupHandle
 from torchtitan.rl.rollout.types import (
     Prompt,
     Rollout,
@@ -746,6 +752,19 @@ def _finished_group(group_id: int) -> FinishedRolloutGroup:
     return FinishedRolloutGroup.from_group(RolloutGroup(group_id=group_id, rollouts=[]))
 
 
+def _handle(group_id: int) -> PackedRolloutGroupHandle:
+    """A handle to an empty group in a rollout worker; only its type matters here."""
+    return PackedRolloutGroupHandle(
+        buffer=None,
+        group_id=group_id,
+        generation=1,
+        rollout_ids=(),
+        rollout_regions=(),
+        rollout_image_hashes=(),
+        image_regions={},
+    )
+
+
 async def _finalize(buffer: RolloutGroupWorkBuffer, group_id: int) -> None:
     await buffer.finalize_work(_finished_group(group_id))
 
@@ -811,19 +830,32 @@ def test_no_window_takes_oldest_ready_group_past_a_stuck_head() -> None:
 
 
 def _finalize_one_group_with_rollout_loop(
-    run_group_rollouts, recorder
+    run_group_rollouts,
+    recorder,
+    *,
+    rdma_min_group_bytes: int | None = None,
+    released_group_ids: list[list[int]] | None = None,
 ) -> FinishedRolloutGroup:
-    """Run `_rollout_loop` on one admitted group and return the group it finalizes."""
+    """Run `_rollout_loop` on one admitted group and return the group it finalizes; the ids the
+    loop tells the rollout workers to release go to `released_group_ids`."""
 
     async def run() -> FinishedRolloutGroup:
         buffer = _buffer(capacity=1, window_size=None)
         await _admit(buffer, 0)
         controller = object.__new__(Controller)
         controller.config = SimpleNamespace(
-            async_loop=SimpleNamespace(num_samples_per_prompt=1)
+            async_loop=SimpleNamespace(num_samples_per_prompt=1),
+            rollouter=SimpleNamespace(
+                worker=SimpleNamespace(rdma_min_group_bytes=rdma_min_group_bytes)
+            ),
         )
         controller._sampling = SamplingConfig()
-        controller._rollouter = SimpleNamespace(run_group_rollouts=run_group_rollouts)
+        controller._rollouter = SimpleNamespace(
+            run_group_rollouts=run_group_rollouts,
+            release_groups=(
+                released_group_ids.append if released_group_ids is not None else None
+            ),
+        )
         controller.rollout_recorder = recorder
         controller.generator_router = SimpleNamespace(
             release_groups=SimpleNamespace(call_one=AsyncMock())
@@ -883,6 +915,52 @@ def test_rollout_loop_turns_a_failed_group_into_one_failure_metric() -> None:
         "rollout/group_failures/sum": 1.0
     }
     recorder.append_lines.assert_not_called()
+
+
+def test_rollout_loop_releases_the_worker_buffer_of_a_group_that_fails_after_packing() -> None:
+    """A group its worker may have kept, but that fails in the controller before it is
+    finalized, becomes an empty failed group; the loop tells the workers to release its buffer,
+    since no step will train it."""
+
+    async def run_group_rollouts(*, group_id: int, **kwargs) -> FinishedRolloutGroup:
+        return FinishedRolloutGroup.from_group(
+            RolloutGroup(group_id=group_id, rollouts=[]), recorder_lines="{}\n"
+        )
+
+    recorder = Mock()
+    recorder.append_lines.side_effect = OSError("disk full")
+    released_group_ids: list[list[int]] = []
+    finished = _finalize_one_group_with_rollout_loop(
+        run_group_rollouts,
+        recorder,
+        rdma_min_group_bytes=1,
+        released_group_ids=released_group_ids,
+    )
+
+    assert m.MetricsProcessor._aggregate_metrics(finished.summary.group.metrics) == {
+        "rollout/group_failures/sum": 1.0
+    }
+    assert released_group_ids == [[0]]
+
+
+def test_a_probe_read_that_hangs_fails_setup_naming_the_leader_and_hosts() -> None:
+    """A fabric that hangs instead of failing must still fail setup with a clear error."""
+
+    async def hang(probes) -> None:
+        await asyncio.Event().wait()
+
+    leaders = [
+        SimpleNamespace(check_rdma_probes=SimpleNamespace(call_one=AsyncMock())),
+        SimpleNamespace(check_rdma_probes=SimpleNamespace(call_one=hang)),
+    ]
+    probes = [SimpleNamespace(host="worker-b"), SimpleNamespace(host="worker-a")]
+
+    with pytest.raises(
+        ValueError,
+        match=r"DP rank 1 did not finish .* \['worker-a', 'worker-b'\] .* within 0.05 s",
+    ):
+        asyncio.run(check_rdma_probes_on_leaders(leaders, probes, timeout_s=0.05))
+    leaders[0].check_rdma_probes.call_one.assert_awaited_once_with(probes)
 
 
 def test_batcher_loop_times_each_add_group_call() -> None:
@@ -950,6 +1028,7 @@ def test_batcher_loop_keeps_only_the_packed_bytes_of_trainable_groups() -> None:
         controller = object.__new__(Controller)
         controller._group_buffer = buffer
         controller._packed_groups_by_id = {}
+        controller._handle_group_ids = set()
         controller.batcher = SimpleNamespace(
             add_group=SimpleNamespace(call_one=add_group)
         )
@@ -964,6 +1043,50 @@ def test_batcher_loop_keeps_only_the_packed_bytes_of_trainable_groups() -> None:
     packed_groups_by_id = asyncio.run(asyncio.wait_for(run(), timeout=10))
 
     assert packed_groups_by_id == {0: finished_groups[0].packed}
+
+
+def test_batcher_loop_releases_an_untrainable_group_in_its_worker_at_once() -> None:
+    """A group that stays in its worker and that the batcher drops goes back to the worker's
+    pool right away; a trainable one waits for its step; a group sent by value needs no
+    release."""
+    released: list[list[int]] = []
+
+    async def add_group(*, summary):
+        # Groups 0 (in its worker) and 2 (by value) are untrainable; group 1 (in its worker)
+        # fills a batch.
+        group_id = summary.group.group_id
+        batch = SimpleNamespace(metrics=[]) if group_id == 1 else None
+        return batch, group_id == 1, 0.0
+
+    async def run() -> Controller:
+        buffer = _buffer(capacity=3, window_size=None)
+        for group_id in (0, 2, 1):
+            await _admit(buffer, group_id)
+            await buffer.claim_next()
+            finished = _finished_group(group_id)
+            if group_id != 2:
+                finished = replace(finished, packed=_handle(group_id))
+            await buffer.finalize_work(finished)
+        controller = object.__new__(Controller)
+        controller._group_buffer = buffer
+        controller._packed_groups_by_id = {}
+        controller._handle_group_ids = set()
+        controller._rollouter = SimpleNamespace(release_groups=released.append)
+        controller.batcher = SimpleNamespace(
+            add_group=SimpleNamespace(call_one=add_group)
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.create_task(controller._batcher_loop(training_batch_queue=queue))
+        await queue.get()
+        await buffer.close()
+        await loop
+        return controller
+
+    controller = asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+    assert released == [[0]]
+    assert controller._handle_group_ids == {1}
+    assert list(controller._packed_groups_by_id) == [1]
 
 
 async def _settle() -> None:

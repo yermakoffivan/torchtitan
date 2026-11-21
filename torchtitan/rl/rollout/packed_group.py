@@ -26,6 +26,7 @@ import functools
 import math
 import pickle
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 
 import numpy as np
@@ -129,6 +130,9 @@ def _field_names(turn_type: type) -> tuple[str, ...]:
 
 def pack_rollout_group(
     group: RolloutGroup,
+    *,
+    allocate: Callable[[int], np.ndarray] = functools.partial(np.zeros, dtype=np.uint8),
+    region_padding: int = 0,
 ) -> tuple[RolloutGroupSummary, PackedRolloutGroup]:
     """Split `group` into its summary and its bytes: the bytes go into one buffer, with each
     rollout pickled into its region, so `unpack_rollout_group` rebuilds the rollouts.
@@ -139,6 +143,11 @@ def pack_rollout_group(
     costs more to pickle and unpickle, and unpacking replaces it anyway). The envs read each
     image file once per rollout, so a group of G rollouts holds G equal copies; the buffer keeps
     one per `hash_value`.
+
+    `allocate(num_bytes)` returns the uint8 buffer to write into (by default a new zeroed one);
+    only headers, arrays and image files are written, so alignment gaps keep what it held.
+    `region_padding` bytes before and after every region stay outside it, for the caller's own
+    markers (`packed_group_handle.py`).
 
     Example:
         summary, packed = pack_rollout_group(group)
@@ -200,8 +209,8 @@ def pack_rollout_group(
             protocol=pickle.HIGHEST_PROTOCOL,
         )
         arrays_offset = _align(_METADATA_LENGTH.size + len(metadata))
-        start = _align(position)
-        position = start + arrays_offset + num_array_bytes
+        start = _align(position + region_padding)
+        position = start + arrays_offset + num_array_bytes + region_padding
         rollout_image_hashes.append(
             tuple(
                 dict.fromkeys(
@@ -214,7 +223,7 @@ def pack_rollout_group(
         rollout_payloads.append(
             (
                 start,
-                position - start,
+                arrays_offset + num_array_bytes,
                 metadata,
                 arrays_offset,
                 rollout_layout,
@@ -223,11 +232,11 @@ def pack_rollout_group(
         )
     image_spans = {}
     for hash_value, data in image_data.items():
-        start = _align(position)
-        position = start + len(data)
+        start = _align(position + region_padding)
+        position = start + len(data) + region_padding
         image_spans[hash_value] = start
 
-    buffer = np.zeros(position, dtype=np.uint8)
+    buffer = allocate(position)
     rollout_regions = []
     for (
         start,

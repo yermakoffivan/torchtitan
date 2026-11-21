@@ -154,7 +154,9 @@ def _controller(
         sync_log_step=sync_log_step,
         commit_training_sample_ids=lambda group_ids: None,
         state_dict=lambda: {},
+        release_groups=lambda group_ids: events.append(f"release_groups {group_ids}"),
     )
+    controller._handle_group_ids = set()
     controller._group_buffer = SimpleNamespace(
         metrics=lambda: [], release_slots=release_slots
     )
@@ -267,6 +269,27 @@ def test_push_then_pull_then_release_after_each_optimizer_step() -> None:
         "pull 2",
         "release_slots [5, 6, 7, 8, 9] trained",
     ]
+
+
+def test_worker_groups_are_released_once_after_their_step_releases_their_slots() -> None:
+    """A trained group that stays in its rollout worker goes back to the worker's pool only
+    after its step's `forward_backward` returned (every leader read is done) and the pull released
+    its slot; groups sent by value are not released."""
+    events: list[str] = []
+    controller = _controller(events)
+    # Batch 0 trains groups 0..4, batch 1 groups 5..9; groups 1, 3 and 6 stay in their workers.
+    controller._handle_group_ids = {1, 3, 6}
+
+    _run(controller, num_training_steps=2)
+
+    releases = [event for event in events if event.startswith("release_groups")]
+    assert releases == ["release_groups [1, 3]", "release_groups [6]"]
+    assert events.index("release_groups [1, 3]") > events.index("fwd_bwd 1")
+    assert (
+        events.index("release_groups [1, 3]")
+        == events.index("release_slots [0, 1, 2, 3, 4] trained") + 1
+    )
+    assert controller._handle_group_ids == set()
 
 
 def test_optimizer_step_waits_for_the_previous_push() -> None:
