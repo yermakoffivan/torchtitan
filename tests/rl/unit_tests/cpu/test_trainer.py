@@ -209,6 +209,7 @@ def test_rl_trainer_validates_model_training_config_before_initialization(
                 pad_id=0,
                 temperature=1.0,
                 vision_processor=None,
+                rollout_groups_by_rdma=False,
             )
 
     validate.assert_called_once_with(
@@ -287,22 +288,17 @@ def test_check_rdma_probes_reads_off_the_event_loop(monkeypatch) -> None:
     """The probe reads block; on a worker thread, one that hangs past the controller's timeout
     leaves the leader actor's event loop free for later calls."""
     trainer = object.__new__(Trainer)
-    trainer._is_replica_leader = True
-    trainer._rdma_byte_buffers = None
-    read_threads = []
-    monkeypatch.setattr(
-        "torchtitan.rl.trainer.trainer.RDMAByteBuffers", lambda: "buffers"
-    )
+    trainer._rdma_byte_buffers = "buffers"
+    reads = []
     monkeypatch.setattr(
         "torchtitan.rl.trainer.trainer.check_rdma_probes",
-        lambda buffers, probes: read_threads.append(threading.current_thread()),
+        lambda buffers, probes: reads.append((buffers, threading.current_thread())),
     )
 
     asyncio.run(trainer.check_rdma_probes(["probe"]))
 
-    assert trainer._rdma_byte_buffers == "buffers"
-    assert len(read_threads) == 1
-    assert read_threads[0] is not threading.main_thread()
+    [(buffers, thread)] = reads
+    assert buffers == "buffers" and thread is not threading.main_thread()
 
 
 def test_policy_version_is_restored_with_training_engine_state() -> None:
@@ -336,6 +332,7 @@ def _leader(
     trainer._replica_group = None
     trainer._is_replica_leader = True
     trainer._replica_column = None
+    trainer._rollout_groups_by_rdma = False
     trainer._rdma_byte_buffers = None
     trainer._num_microbatches_per_group = num_microbatches_per_group
     trainer._training_sample_builder = fake_training_sample_builder
@@ -433,9 +430,7 @@ def test_forward_backward_accumulates_microbatch_metrics() -> None:
         assert result.pop("timing/trainer/pack_microbatches/max") > 0
         # No other rank in the replica: nothing to broadcast.
         assert result.pop("timing/trainer/broadcast_microbatches/max") == 0
-        # Every group came by value: nothing read from the rollout workers.
-        assert result.pop("timing/trainer/read_rollout_groups/max") == 0
-        assert result.pop("payload/trainer_read_bytes/max") == 0
+        # Groups go by value (`rdma_min_group_bytes=None`): no read metrics.
         # One reduction per microbatch, then one for the timings.
         assert trainer._reduce_forward_backward_metrics.call_count == 3
         assert result == {"loss/mean": 3.0, "loss/max": 4.0}

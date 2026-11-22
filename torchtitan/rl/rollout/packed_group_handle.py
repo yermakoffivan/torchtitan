@@ -23,13 +23,17 @@ import itertools
 import struct
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rollout.packed_group import pack_rollout_group, PackedRolloutGroup
+from torchtitan.rl.rollout.packed_group import (
+    pack_rollout_group,
+    PackedRolloutGroup,
+    selected_rollout_fields,
+)
 
 if TYPE_CHECKING:
     from torchtitan.rl.rollout.types import RolloutGroup, RolloutGroupSummary
@@ -93,33 +97,8 @@ class PackedRolloutGroupHandle:
     def select(self, rollout_ids: set[int]) -> PackedRolloutGroupHandle:
         """Only the rollouts in `rollout_ids` and the images they show, as
         `PackedRolloutGroup.select`."""
-        kept = [
-            index
-            for index, rollout_id in enumerate(self.rollout_ids)
-            if rollout_id in rollout_ids
-        ]
-        if len(kept) == len(self.rollout_ids):
-            return self
-        image_hashes = {
-            hash_value
-            for index in kept
-            for hash_value in self.rollout_image_hashes[index]
-        }
-        return PackedRolloutGroupHandle(
-            buffer=self.buffer,
-            group_id=self.group_id,
-            generation=self.generation,
-            rollout_ids=tuple(self.rollout_ids[index] for index in kept),
-            rollout_regions=tuple(self.rollout_regions[index] for index in kept),
-            rollout_image_hashes=tuple(
-                self.rollout_image_hashes[index] for index in kept
-            ),
-            image_regions={
-                hash_value: region
-                for hash_value, region in self.image_regions.items()
-                if hash_value in image_hashes
-            },
-        )
+        selected = selected_rollout_fields(self, rollout_ids)
+        return self if selected is None else replace(self, **selected)
 
 
 class RolloutGroupBuffers:

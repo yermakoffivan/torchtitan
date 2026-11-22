@@ -28,6 +28,7 @@ import pickle
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
@@ -37,6 +38,9 @@ from torchtitan.rl.rollout.types import (
     RolloutGroup,
     RolloutGroupSummary,
 )
+
+if TYPE_CHECKING:
+    from torchtitan.rl.rollout.packed_group_handle import PackedRolloutGroupHandle
 
 # Every region, and every array in a rollout region, starts at a multiple of this many bytes.
 _ALIGNMENT = 64
@@ -96,31 +100,38 @@ class PackedRolloutGroup:
         """Only the rollouts in `rollout_ids` (by `Rollout.rollout_id`) and the image files they
         show, with no copy: the same region arrays, fewer of them. What a DP replica leader
         gets: a group's rollouts can train on several replicas."""
-        kept = [
-            index
-            for index, rollout_id in enumerate(self.rollout_ids)
-            if rollout_id in rollout_ids
-        ]
-        if len(kept) == len(self.rollout_ids):
-            return self
-        image_hashes = {
-            hash_value
-            for index in kept
-            for hash_value in self.rollout_image_hashes[index]
-        }
-        return PackedRolloutGroup(
-            group_id=self.group_id,
-            rollout_ids=tuple(self.rollout_ids[index] for index in kept),
-            rollout_regions=tuple(self.rollout_regions[index] for index in kept),
-            rollout_image_hashes=tuple(
-                self.rollout_image_hashes[index] for index in kept
-            ),
-            image_regions={
-                hash_value: region
-                for hash_value, region in self.image_regions.items()
-                if hash_value in image_hashes
-            },
-        )
+        selected = selected_rollout_fields(self, rollout_ids)
+        return self if selected is None else replace(self, **selected)
+
+
+def selected_rollout_fields(
+    group: PackedRolloutGroup | PackedRolloutGroupHandle, rollout_ids: set[int]
+) -> dict[str, Any] | None:
+    """The fields `group.select(rollout_ids)` replaces: its rollouts in `rollout_ids` and the
+    regions of the images they show. None when every rollout is kept. Both kinds of packed
+    group select this way; they differ only in what a region is (bytes or a byte range)."""
+    kept = [
+        index
+        for index, rollout_id in enumerate(group.rollout_ids)
+        if rollout_id in rollout_ids
+    ]
+    if len(kept) == len(group.rollout_ids):
+        return None
+    image_hashes = {
+        hash_value for index in kept for hash_value in group.rollout_image_hashes[index]
+    }
+    return {
+        "rollout_ids": tuple(group.rollout_ids[index] for index in kept),
+        "rollout_regions": tuple(group.rollout_regions[index] for index in kept),
+        "rollout_image_hashes": tuple(
+            group.rollout_image_hashes[index] for index in kept
+        ),
+        "image_regions": {
+            hash_value: region
+            for hash_value, region in group.image_regions.items()
+            if hash_value in image_hashes
+        },
+    }
 
 
 @functools.cache

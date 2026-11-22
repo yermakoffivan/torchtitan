@@ -388,11 +388,15 @@ class BaseRolloutWorker(Configurable, ABC):
         moves none of their bytes. Keep small groups by value: a leader reads every group of its
         column before its first microbatch, and at 1, alphabet sort's 4.6 KB groups (256 per
         step) added ~95 ms to that wait; ~1 MiB is a reasonable threshold.
-        Needs torch transport in every rollout worker and trainer DP replica leader; setup reads
+        Needs NIXL (`nixl==1.5.0` and `nixl-cu13`, installed by `scripts/install_rl_env.sh`) in
+        every rollout worker and trainer DP replica leader, whatever
+        `ModelStateDictTransport.Config.backend` is: the two are separate transports. Setup reads
         a probe from each worker on each leader and raises if a read fails or does not finish.
-        A worker's pool never shrinks: for each buffer size class (steps of at most 25%) it
-        keeps the most buffers that class ever had in use at once, usually reached in the first
-        steps, when every rollout slot fills before the first release."""
+        A worker's pool never shrinks, because a reader keeps stale sections of unregistered
+        buffers (reproduced on NIXL; Mooncake is untested here): for each buffer size class
+        (steps of at most 25%) it keeps the most buffers that class ever had in use at once,
+        usually reached in the first steps, when every rollout slot fills before the first
+        release."""
 
         def __post_init__(self) -> None:
             if self.rdma_min_image_bytes is not None and self.rdma_min_image_bytes < 1:

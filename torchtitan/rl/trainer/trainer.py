@@ -165,6 +165,7 @@ class Trainer(Configurable):
         pad_id: int,
         temperature: float,
         vision_processor: VisionProcessor.Config | None,
+        rollout_groups_by_rdma: bool,
     ):
         init_logger()
         # Quiet torchstore's per-op transport-resolve INFO spam (very noisy in CI).
@@ -270,9 +271,16 @@ class Trainer(Configurable):
         )
         # Set on the leader by `receive_replica_column` before each `forward_backward`.
         self._replica_column: ReplicaColumn | None = None
-        # On leaders, once `check_rdma_probes` runs: reads the rollout groups that stay in
-        # the rollout workers (`BaseRolloutWorker.Config.rdma_min_group_bytes`).
-        self._rdma_byte_buffers: RDMAByteBuffers | None = None
+        # Whether rollout groups can stay in the rollout workers
+        # (`BaseRolloutWorker.Config.rdma_min_group_bytes`); the same on every rank, so the
+        # read metrics are reduced on every rank or on none.
+        self._rollout_groups_by_rdma = rollout_groups_by_rdma
+        # On leaders, then: reads those groups over torch transport.
+        self._rdma_byte_buffers: RDMAByteBuffers | None = (
+            RDMAByteBuffers()
+            if rollout_groups_by_rdma and self._is_replica_leader
+            else None
+        )
 
     @property
     def policy_version(self) -> int:
@@ -345,15 +353,13 @@ class Trainer(Configurable):
         return out
 
     async def check_rdma_probes(self, probes: list[RDMAProbe]) -> None:
-        """On a DP replica's leader, at setup when rollout groups go by RDMA: start this rank's
-        torch transport and read each rollout worker's probe (`check_rdma_probes`).
+        """On a DP replica's leader, at setup when rollout groups go by RDMA: read each rollout
+        worker's probe (`check_rdma_probes`).
 
         Raises:
-            ValueError: torch transport is unavailable here, or a probe read failed; the
-                message names the hosts.
+            ValueError: a probe read failed; the message names the hosts.
         """
-        assert self._is_replica_leader and self._rdma_byte_buffers is None
-        self._rdma_byte_buffers = RDMAByteBuffers()
+        assert self._rdma_byte_buffers is not None
         # The reads block; off the event loop, a read that hangs past the controller's timeout
         # leaves this actor able to answer later calls (e.g. shutdown).
         await asyncio.to_thread(check_rdma_probes, self._rdma_byte_buffers, probes)
@@ -452,12 +458,6 @@ class Trainer(Configurable):
         # its replica leader's read and packing (the leader sends them with each group, so the
         # last pipeline stage reports them too) and its own broadcast time.
         max_reduced_timing = {
-            "timing/trainer/read_rollout_groups/max": torch.tensor(
-                reader.read_s, device=engine.device
-            ),
-            "payload/trainer_read_bytes/max": torch.tensor(
-                float(reader.read_bytes), device=engine.device
-            ),
             "timing/trainer/pack_microbatches/max": torch.tensor(
                 reader.pack_s, device=engine.device
             ),
@@ -465,6 +465,13 @@ class Trainer(Configurable):
                 reader.broadcast_s, device=engine.device
             ),
         }
+        if self._rollout_groups_by_rdma:
+            max_reduced_timing["timing/trainer/read_rollout_groups/max"] = torch.tensor(
+                reader.read_s, device=engine.device
+            )
+            max_reduced_timing["payload/trainer_read_bytes/max"] = torch.tensor(
+                float(reader.read_bytes), device=engine.device
+            )
         metrics.update(
             self._reduce_forward_backward_metrics(
                 sum_reduced_metrics={}, max_reduced_metrics=max_reduced_timing
