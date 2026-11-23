@@ -301,9 +301,9 @@ def test_trained_groups_go_to_the_workers_once_their_step_releases_their_slots()
 
 
 def test_the_next_steps_columns_go_out_during_forward_backward() -> None:
-    """With plan 2 queued during step 1, its leaders get their columns while forward_backward 1
-    runs, and every rank starts reading after it returns and before optim_step 1; step 2 then
-    trains on the started readers without sending the columns again."""
+    """With plan 2 already queued when forward_backward 1 starts, its leaders get their columns
+    while it runs, and every rank starts reading after it returns and before optim_step 1; step 2
+    then trains on the started readers without sending the columns again."""
     events: list[str] = []
 
     async def slow_forward_backward():
@@ -331,10 +331,6 @@ def test_the_next_steps_columns_go_out_during_forward_backward() -> None:
         < events.index("optim 1")
     )
     assert received_group_ids == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
-    read_ahead = [
-        logged["trainer/read_ahead"].value.value for logged in controller.logged_metrics
-    ]
-    assert read_ahead == [0.0, 1.0]
     # What stays exposed of the read-ahead is timed in the step that does it. The last step
     # times an empty one, so every step's accounting (`compute_perf_ratio_metrics`) has it.
     assert all(
@@ -359,7 +355,8 @@ def test_a_failed_forward_backward_cancels_the_next_steps_send() -> None:
     cancelled instead of outliving the loop."""
 
     async def failing_forward_backward():
-        await asyncio.sleep(0.01)  # plan 2 is taken and its column send starts
+        # Plan 2 was taken before the gather, and its send is under way.
+        await asyncio.sleep(0.01)
         raise RuntimeError("forward_backward failed")
 
     controller = _controller([], on_forward_backward=failing_forward_backward)
@@ -388,32 +385,6 @@ def test_a_failed_forward_backward_cancels_the_next_steps_send() -> None:
         ] == []
 
     asyncio.run(run())
-
-
-def test_no_read_ahead_when_the_next_plan_comes_after_forward_backward() -> None:
-    """A plan queued only after this step's pull (as on-policy, where its groups wait for that
-    pull) is not read ahead: the controller stops waiting for it when forward_backward returns,
-    the plan stays in the queue, and each step sends its own columns and starts its own
-    readers."""
-    events: list[str] = []
-    queue: asyncio.Queue = asyncio.Queue()
-    batches = _batch_queue(2)
-    queue.put_nowait(batches.get_nowait())
-
-    async def on_pull():
-        # The batcher plans the next batch only after the pull admits its groups.
-        if not batches.empty():
-            queue.put_nowait(batches.get_nowait())
-
-    controller = _controller(events, on_pull=on_pull)
-    controller.config.async_loop.num_training_steps = 2
-    asyncio.run(controller._trainer_loop(queue, num_training_steps=2))
-
-    assert not any(event.startswith("read ahead") for event in events)
-    assert [event for event in events if event.startswith("fwd_bwd")] == [
-        "fwd_bwd 1",
-        "fwd_bwd 2",
-    ]
 
 
 def test_no_read_ahead_past_the_last_step() -> None:

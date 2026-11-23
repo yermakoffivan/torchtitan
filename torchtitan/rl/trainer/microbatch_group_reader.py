@@ -20,10 +20,10 @@ Rollout groups that stay in their rollout workers (`BaseRolloutWorker.Config.rdm
 reach the leader as handles; before packing the first microbatch group, the leader reads the
 regions its column names from every worker at once (`read_packed_rollout_group_handles`).
 
-When the next step's plan is ready before this step's optimizer step (off-policy runs), the
-controller starts the next step's readers early (`MicrobatchGroupReader.start`), so the leader's
-reads, materialize and first packs overlap the optimizer step instead of delaying the next
-forward/backward.
+When the next step's plan is already queued as this step's forward/backward starts (off-policy
+runs), the controller starts the next step's readers right after it (`MicrobatchGroupReader.start`),
+so the leader's reads, materialize and first packs overlap the optimizer step instead of delaying
+the next forward/backward.
 """
 
 from __future__ import annotations
@@ -58,6 +58,11 @@ if TYPE_CHECKING:
 # Groups made ahead of the one the engine waits on. A rank holds at most 4 microbatch groups
 # on the host: these 2, the one waited on, and the previous one, still in the engine's loop.
 _NUM_MICROBATCH_GROUPS_READ_AHEAD = 2
+
+
+def _new_read_pool() -> ThreadPoolExecutor:
+    """The one thread that makes a pass's microbatch groups."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="microbatch_group_read")
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +189,7 @@ class MicrobatchGroupReader:
                 train(group)
         """
         assert self._started is None and not self._iterated
-        pool = self._new_thread()
+        pool = _new_read_pool()
         reads: deque[Future[list[TrainingMicrobatch]]] = deque()
         for index in range(
             min(self._num_microbatch_groups, _NUM_MICROBATCH_GROUPS_READ_AHEAD)
@@ -213,7 +218,7 @@ class MicrobatchGroupReader:
                 return read.result()
 
         if self._started is None:
-            pool, reads = self._new_thread(), deque()
+            pool, reads = _new_read_pool(), deque()
         else:
             (pool, reads), self._started = self._started, None
         try:
@@ -228,12 +233,6 @@ class MicrobatchGroupReader:
             # reads, and don't wait for the running one: a rank receiving from a leader that
             # failed would wait out the gloo timeout.
             pool.shutdown(wait=False, cancel_futures=True)
-
-    @staticmethod
-    def _new_thread() -> ThreadPoolExecutor:
-        return ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="microbatch_group_read"
-        )
 
     def _submit(
         self, pool: ThreadPoolExecutor, index: int

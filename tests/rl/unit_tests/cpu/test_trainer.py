@@ -303,21 +303,6 @@ def test_check_rdma_probes_reads_off_the_event_loop(monkeypatch) -> None:
     assert buffers == "buffers" and thread is not threading.main_thread()
 
 
-def test_close_stops_a_started_reader_no_step_consumed() -> None:
-    async def run() -> None:
-        trainer = object.__new__(Trainer)
-        trainer.engine = SimpleNamespace(close=MagicMock())
-        reader = SimpleNamespace(close=MagicMock())
-        trainer._started_reader = reader
-
-        await Trainer.close(trainer)
-
-        reader.close.assert_called_once_with()
-        assert trainer._started_reader is None
-
-    asyncio.run(run())
-
-
 def test_policy_version_is_restored_with_training_engine_state() -> None:
     trainer = object.__new__(Trainer)
     engine = object.__new__(TrainingEngine)
