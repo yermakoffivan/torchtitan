@@ -48,15 +48,10 @@ def _qwen3_5_9b_ulysses_lean_remat_offload(
     runs between its forward and its backward, so its copies could not overlap
     compute.
 
-    ``max_num_documents`` caps document pieces per row. Each slot costs fp32
-    GDN state (about 9 MiB per rank), and a row stops taking documents once it
-    is full, padding the rest. The recipes below size it for the OpenGenome3
-    DNA sample (3 sources x 5 length tiers x 50 documents), whose shortest
-    document has 131351 tokens. A row of N tokens then holds whole documents
-    plus a partial piece at each end, at most ``(N - 1) // 131351 + 2`` pieces,
-    so the cap never pads. Shuffled packing of all tiers needs at most 8, 11
-    and 14 pieces (p99: 4, 6 and 9) at 1M, 2M and 4M. Recompute it from the
-    shortest document in your data; the C4 placeholder needs far more.
+    ``max_num_documents`` caps document pieces per row (about 9 MiB of GDN
+    state per slot). The recipes size it for the OpenGenome3 DNA sample, whose
+    shortest document has 131351 tokens, so an N-token row holds at most
+    ``(N - 1) // 131351 + 2`` pieces and never pads.
     """
     parallelism = ParallelismConfig()
     model_config = build_model_config(
